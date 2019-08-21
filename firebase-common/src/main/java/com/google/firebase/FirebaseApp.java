@@ -39,9 +39,11 @@ import com.google.android.gms.common.internal.Preconditions;
 import com.google.android.gms.common.util.PlatformVersion;
 import com.google.android.gms.common.util.ProcessUtils;
 import com.google.firebase.components.Component;
+import com.google.firebase.components.ComponentContainer;
 import com.google.firebase.components.ComponentDiscovery;
 import com.google.firebase.components.ComponentRegistrar;
 import com.google.firebase.components.ComponentRuntime;
+import com.google.firebase.components.Dependency;
 import com.google.firebase.components.Lazy;
 import com.google.firebase.events.Publisher;
 import com.google.firebase.internal.DataCollectionConfigStorage;
@@ -51,6 +53,7 @@ import com.google.firebase.platforminfo.LibraryVersionComponent;
 import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -105,7 +108,6 @@ public class FirebaseApp {
 
   private final Context applicationContext;
   private final String name;
-  private final FirebaseOptions options;
   private final ComponentRuntime componentRuntime;
 
   // Default disabled. We released Firebase publicly without this feature, so making it default
@@ -137,7 +139,7 @@ public class FirebaseApp {
   @NonNull
   public FirebaseOptions getOptions() {
     checkNotDeleted();
-    return options;
+    return componentRuntime.get(FirebaseOptions.class);
   }
 
   @Override
@@ -155,7 +157,10 @@ public class FirebaseApp {
 
   @Override
   public String toString() {
-    return Objects.toStringHelper(this).add("name", name).add("options", options).toString();
+    return Objects.toStringHelper(this)
+        .add("name", name)
+        .add("options", componentRuntime.get(FirebaseOptions.class))
+        .toString();
   }
 
   /** Returns a mutable list of all FirebaseApps. */
@@ -239,16 +244,7 @@ public class FirebaseApp {
       if (INSTANCES.containsKey(DEFAULT_APP_NAME)) {
         return getInstance();
       }
-      FirebaseOptions firebaseOptions = FirebaseOptions.fromResource(context);
-      if (firebaseOptions == null) {
-        Log.w(
-            LOG_TAG,
-            "Default FirebaseApp failed to initialize because no default "
-                + "options were found. This usually means that com.google.gms:google-services was "
-                + "not applied to your gradle project.");
-        return null;
-      }
-      return initializeApp(context, firebaseOptions);
+      return initializeAppInternal(context, DEFAULT_APP_NAME);
     }
   }
 
@@ -263,6 +259,7 @@ public class FirebaseApp {
   @NonNull
   public static FirebaseApp initializeApp(
       @NonNull Context context, @NonNull FirebaseOptions options) {
+    Preconditions.checkNotNull(options, "FirebaseOptions cannot be null");
     return initializeApp(context, options, DEFAULT_APP_NAME);
   }
 
@@ -273,12 +270,18 @@ public class FirebaseApp {
    * @param options represents the global {@link FirebaseOptions}
    * @param name unique name for the app. It is an error to initialize an app with an already
    *     existing name. Starting and ending whitespace characters in the name are ignored (trimmed).
-   * @throws IllegalStateException if an app with the same name has already been initialized.
    * @return an instance of {@link FirebaseApp}
+   * @throws IllegalStateException if an app with the same name has already been initialized.
    */
   @NonNull
   public static FirebaseApp initializeApp(
       @NonNull Context context, @NonNull FirebaseOptions options, @NonNull String name) {
+    registerFirebaseOptions(name, options);
+    return initializeAppInternal(context, name);
+  }
+
+  @NonNull
+  public static FirebaseApp initializeAppInternal(@NonNull Context context, @NonNull String name) {
     GlobalBackgroundStateListener.ensureBackgroundStateListenerRegistered(context);
     String normalizedName = normalize(name);
     final FirebaseApp firebaseApp;
@@ -295,7 +298,12 @@ public class FirebaseApp {
           "FirebaseApp name " + normalizedName + " already exists!");
 
       Preconditions.checkNotNull(applicationContext, "Application context cannot be null.");
-      firebaseApp = new FirebaseApp(applicationContext, normalizedName, options);
+      firebaseApp = new FirebaseApp(applicationContext, normalizedName);
+
+      // Return a null FirebaseApp to signal to the caller that we couldn't get FirebaseOptions.
+      if (firebaseApp.getOptions() == null) {
+        return null;
+      }
       INSTANCES.put(normalizedName, firebaseApp);
     }
 
@@ -392,10 +400,9 @@ public class FirebaseApp {
    *
    * @hide
    */
-  protected FirebaseApp(Context applicationContext, String name, FirebaseOptions options) {
+  protected FirebaseApp(Context applicationContext, String name) {
     this.applicationContext = Preconditions.checkNotNull(applicationContext);
     this.name = Preconditions.checkNotEmpty(name);
-    this.options = Preconditions.checkNotNull(options);
 
     List<ComponentRegistrar> registrars =
         ComponentDiscovery.forContext(applicationContext).discover();
@@ -407,7 +414,12 @@ public class FirebaseApp {
             registrars,
             Component.of(applicationContext, Context.class),
             Component.of(this, FirebaseApp.class),
-            Component.of(options, FirebaseOptions.class),
+            Component.of(new ContainerInfo(name), ContainerInfo.class),
+            Component.builder(FirebaseOptions.class)
+                .add(Dependency.required(Context.class))
+                .add(Dependency.required(ContainerInfo.class))
+                .factory(FirebaseApp::getFirebaseOptions)
+                .build(),
             LibraryVersionComponent.create(FIREBASE_ANDROID, ""),
             LibraryVersionComponent.create(FIREBASE_COMMON, BuildConfig.VERSION_NAME),
             kotlinVersion != null ? LibraryVersionComponent.create(KOTLIN, kotlinVersion) : null,
@@ -420,6 +432,50 @@ public class FirebaseApp {
                     applicationContext,
                     getPersistenceKey(),
                     componentRuntime.get(Publisher.class)));
+  }
+
+  private static class ContainerInfo {
+
+    private final String appName;
+
+    String getAppName() {
+      return appName;
+    }
+
+    ContainerInfo(String appName) {
+      this.appName = appName;
+    }
+  }
+
+  private static final Map<String, FirebaseOptions> registeredOptions = new HashMap<>();
+
+  private static void registerFirebaseOptions(String appName, FirebaseOptions options) {
+    synchronized (LOCK) {
+      registeredOptions.put(appName, options);
+    }
+  }
+
+  @Nullable
+  private static FirebaseOptions getFirebaseOptions(ComponentContainer container) {
+    String appName = container.get(ContainerInfo.class).getAppName();
+    FirebaseOptions firebaseOptions;
+    synchronized (LOCK) {
+      firebaseOptions = registeredOptions.get(appName);
+    }
+    if (firebaseOptions != null) {
+      return firebaseOptions;
+    }
+    if (appName.equals(DEFAULT_APP_NAME)) {
+      firebaseOptions = FirebaseOptions.fromResource(container.get(Context.class));
+      if (firebaseOptions == null) {
+        Log.w(
+            LOG_TAG,
+            "Default FirebaseApp failed to initialize because no default "
+                + "options were found. This usually means that com.google.gms:google-services was "
+                + "not applied to your gradle project.");
+      }
+    }
+    return firebaseOptions;
   }
 
   private void checkNotDeleted() {
@@ -448,8 +504,8 @@ public class FirebaseApp {
    * <p>If automatic resource management is enabled and the app is in the background a callback is
    * triggered immediately.
    *
-   * @see BackgroundStateChangeListener
    * @hide
+   * @see BackgroundStateChangeListener
    */
   @KeepForSdk
   public void addBackgroundStateChangeListener(BackgroundStateChangeListener listener) {
@@ -511,6 +567,7 @@ public class FirebaseApp {
    * Notifies all listeners with the name and options of the deleted {@link FirebaseApp} instance.
    */
   private void notifyOnAppDeleted() {
+    FirebaseOptions options = componentRuntime.get(FirebaseOptions.class);
     for (FirebaseAppLifecycleListener listener : lifecycleListeners) {
       listener.onDeleted(name, options);
     }
@@ -667,6 +724,7 @@ public class FirebaseApp {
   }
 
   private static class UiExecutor implements Executor {
+
     private static final Handler HANDLER = new Handler(Looper.getMainLooper());
 
     @Override
