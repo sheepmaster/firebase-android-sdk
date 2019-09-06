@@ -23,14 +23,11 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.os.Build;
-import android.os.Handler;
-import android.os.Looper;
 import android.text.TextUtils;
 import android.util.Log;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.annotation.VisibleForTesting;
-import androidx.collection.ArrayMap;
 import androidx.core.os.UserManagerCompat;
 import com.google.android.gms.common.annotation.KeepForSdk;
 import com.google.android.gms.common.api.internal.BackgroundDetector;
@@ -39,9 +36,9 @@ import com.google.android.gms.common.internal.Preconditions;
 import com.google.android.gms.common.util.PlatformVersion;
 import com.google.android.gms.common.util.ProcessUtils;
 import com.google.firebase.components.Component;
-import com.google.firebase.components.ComponentDiscovery;
-import com.google.firebase.components.ComponentRegistrar;
+import com.google.firebase.components.ComponentCompat;
 import com.google.firebase.components.ComponentRuntime;
+import com.google.firebase.components.Dependency;
 import com.google.firebase.components.Lazy;
 import com.google.firebase.events.Publisher;
 import com.google.firebase.heartbeatinfo.DefaultHeartBeatInfo;
@@ -53,12 +50,9 @@ import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
-import javax.annotation.concurrent.GuardedBy;
 
 /**
  * The entry point of Firebase SDKs. It holds common configuration and state for Firebase APIs. Most
@@ -91,14 +85,6 @@ public class FirebaseApp {
   private static final String LOG_TAG = "FirebaseApp";
 
   public static final @NonNull String DEFAULT_APP_NAME = "[DEFAULT]";
-
-  private static final Object LOCK = new Object();
-
-  private static final Executor UI_EXECUTOR = new UiExecutor();
-
-  /** A map of (name, FirebaseApp) instances. */
-  @GuardedBy("LOCK")
-  static final Map<String, FirebaseApp> INSTANCES = new ArrayMap<>();
 
   private static final String FIREBASE_ANDROID = "fire-android";
   private static final String FIREBASE_COMMON = "fire-core";
@@ -162,9 +148,16 @@ public class FirebaseApp {
   /** Returns a mutable list of all FirebaseApps. */
   @NonNull
   public static List<FirebaseApp> getApps(@NonNull Context context) {
-    synchronized (LOCK) {
-      return new ArrayList<>(INSTANCES.values());
+    return getAllApps();
+  }
+
+  @NonNull
+  private static List<FirebaseApp> getAllApps() {
+    List<FirebaseApp> apps = new ArrayList<>();
+    for (ComponentRuntime componentRuntime : ComponentCompat.getAll()) {
+      apps.add(componentRuntime.get(FirebaseApp.class));
     }
+    return apps;
   }
 
   /**
@@ -174,18 +167,16 @@ public class FirebaseApp {
    */
   @NonNull
   public static FirebaseApp getInstance() {
-    synchronized (LOCK) {
-      FirebaseApp defaultApp = INSTANCES.get(DEFAULT_APP_NAME);
-      if (defaultApp == null) {
-        throw new IllegalStateException(
-            "Default FirebaseApp is not initialized in this "
-                + "process "
-                + ProcessUtils.getMyProcessName()
-                + ". Make sure to call "
-                + "FirebaseApp.initializeApp(Context) first.");
-      }
-      return defaultApp;
+    ComponentRuntime componentRuntime = ComponentCompat.get(DEFAULT_APP_NAME);
+    if (componentRuntime == null) {
+      throw new IllegalStateException(
+          "Default FirebaseApp is not initialized in this "
+              + "process "
+              + ProcessUtils.getMyProcessName()
+              + ". Make sure to call "
+              + "FirebaseApp.initializeApp(Context) first.");
     }
+    return componentRuntime.get(FirebaseApp.class);
   }
 
   /**
@@ -197,25 +188,21 @@ public class FirebaseApp {
    */
   @NonNull
   public static FirebaseApp getInstance(@NonNull String name) {
-    synchronized (LOCK) {
-      FirebaseApp firebaseApp = INSTANCES.get(normalize(name));
-      if (firebaseApp != null) {
-        return firebaseApp;
-      }
-
-      List<String> availableAppNames = getAllAppNames();
-      String availableAppNamesMessage;
-      if (availableAppNames.isEmpty()) {
-        availableAppNamesMessage = "";
-      } else {
-        availableAppNamesMessage =
-            "Available app names: " + TextUtils.join(", ", availableAppNames);
-      }
-      String errorMessage =
-          String.format(
-              "FirebaseApp with name %s doesn't exist. %s", name, availableAppNamesMessage);
-      throw new IllegalStateException(errorMessage);
+    ComponentRuntime componentRuntime = ComponentCompat.get(DEFAULT_APP_NAME);
+    if (componentRuntime != null) {
+      return componentRuntime.get(FirebaseApp.class);
     }
+
+    List<String> availableAppNames = getAllAppNames();
+    String availableAppNamesMessage;
+    if (availableAppNames.isEmpty()) {
+      availableAppNamesMessage = "";
+    } else {
+      availableAppNamesMessage = "Available app names: " + TextUtils.join(", ", availableAppNames);
+    }
+    String errorMessage =
+        String.format("FirebaseApp with name %s doesn't exist. %s", name, availableAppNamesMessage);
+    throw new IllegalStateException(errorMessage);
   }
 
   /**
@@ -236,21 +223,23 @@ public class FirebaseApp {
    */
   @Nullable
   public static FirebaseApp initializeApp(@NonNull Context context) {
-    synchronized (LOCK) {
-      if (INSTANCES.containsKey(DEFAULT_APP_NAME)) {
-        return getInstance();
-      }
-      FirebaseOptions firebaseOptions = FirebaseOptions.fromResource(context);
-      if (firebaseOptions == null) {
-        Log.w(
-            LOG_TAG,
-            "Default FirebaseApp failed to initialize because no default "
-                + "options were found. This usually means that com.google.gms:google-services was "
-                + "not applied to your gradle project.");
-        return null;
-      }
-      return initializeApp(context, firebaseOptions);
+    // XXX: This is not synchronized with the call to ComponentCompat.initialize(), so there could
+    // be a race condition where two threads try to initialize the same app.
+    ComponentRuntime componentRuntime = ComponentCompat.get(DEFAULT_APP_NAME);
+    if (componentRuntime != null) {
+      return componentRuntime.get(FirebaseApp.class);
     }
+
+    FirebaseOptions firebaseOptions = FirebaseOptions.fromResource(context);
+    if (firebaseOptions == null) {
+      Log.w(
+          LOG_TAG,
+          "Default FirebaseApp failed to initialize because no default "
+              + "options were found. This usually means that com.google.gms:google-services was "
+              + "not applied to your gradle project.");
+      return null;
+    }
+    return initializeApp(context, firebaseOptions);
   }
 
   /**
@@ -274,32 +263,26 @@ public class FirebaseApp {
    * @param options represents the global {@link FirebaseOptions}
    * @param name unique name for the app. It is an error to initialize an app with an already
    *     existing name. Starting and ending whitespace characters in the name are ignored (trimmed).
-   * @throws IllegalStateException if an app with the same name has already been initialized.
    * @return an instance of {@link FirebaseApp}
+   * @throws IllegalStateException if an app with the same name has already been initialized.
    */
   @NonNull
   public static FirebaseApp initializeApp(
       @NonNull Context context, @NonNull FirebaseOptions options, @NonNull String name) {
     GlobalBackgroundStateListener.ensureBackgroundStateListenerRegistered(context);
-    String normalizedName = normalize(name);
-    final FirebaseApp firebaseApp;
-    Context applicationContext;
-    if (context.getApplicationContext() == null) {
-      // In shared processes' content providers getApplicationContext() can return null.
-      applicationContext = context;
-    } else {
-      applicationContext = context.getApplicationContext();
-    }
-    synchronized (LOCK) {
-      Preconditions.checkState(
-          !INSTANCES.containsKey(normalizedName),
-          "FirebaseApp name " + normalizedName + " already exists!");
-
-      Preconditions.checkNotNull(applicationContext, "Application context cannot be null.");
-      firebaseApp = new FirebaseApp(applicationContext, normalizedName, options);
-      INSTANCES.put(normalizedName, firebaseApp);
-    }
-
+    String kotlinVersion = KotlinDetector.detectVersion();
+    ComponentRuntime componentRuntime =
+        ComponentCompat.initialize(
+            name,
+            context,
+            Component.of(options, FirebaseOptions.class),
+            Component.of(new ContainerInfo(name), ContainerInfo.class),
+            LibraryVersionComponent.create(FIREBASE_ANDROID, ""),
+            LibraryVersionComponent.create(FIREBASE_COMMON, BuildConfig.VERSION_NAME),
+            kotlinVersion != null ? LibraryVersionComponent.create(KOTLIN, kotlinVersion) : null,
+            DefaultUserAgentPublisher.component(),
+            DefaultHeartBeatInfo.component());
+    FirebaseApp firebaseApp = componentRuntime.get(FirebaseApp.class);
     firebaseApp.initializeAllApis();
     return firebaseApp;
   }
@@ -318,9 +301,7 @@ public class FirebaseApp {
       return;
     }
 
-    synchronized (LOCK) {
-      INSTANCES.remove(this.name);
-    }
+    ComponentCompat.delete(name);
 
     notifyOnAppDeleted();
   }
@@ -398,22 +379,7 @@ public class FirebaseApp {
     this.name = Preconditions.checkNotEmpty(name);
     this.options = Preconditions.checkNotNull(options);
 
-    List<ComponentRegistrar> registrars =
-        ComponentDiscovery.forContext(applicationContext).discover();
-
-    String kotlinVersion = KotlinDetector.detectVersion();
-    componentRuntime =
-        new ComponentRuntime(
-            UI_EXECUTOR,
-            registrars,
-            Component.of(applicationContext, Context.class),
-            Component.of(this, FirebaseApp.class),
-            Component.of(options, FirebaseOptions.class),
-            LibraryVersionComponent.create(FIREBASE_ANDROID, ""),
-            LibraryVersionComponent.create(FIREBASE_COMMON, BuildConfig.VERSION_NAME),
-            kotlinVersion != null ? LibraryVersionComponent.create(KOTLIN, kotlinVersion) : null,
-            DefaultUserAgentPublisher.component(),
-            DefaultHeartBeatInfo.component());
+    componentRuntime = Preconditions.checkNotNull(ComponentCompat.get(name));
 
     dataCollectionConfigStorage =
         new Lazy<>(
@@ -450,8 +416,8 @@ public class FirebaseApp {
    * <p>If automatic resource management is enabled and the app is in the background a callback is
    * triggered immediately.
    *
-   * @see BackgroundStateChangeListener
    * @hide
+   * @see BackgroundStateChangeListener
    */
   @KeepForSdk
   public void addBackgroundStateChangeListener(BackgroundStateChangeListener listener) {
@@ -521,10 +487,7 @@ public class FirebaseApp {
   /** @hide */
   @VisibleForTesting
   public static void clearInstancesForTest() {
-    // TODO: also delete, once functionality is implemented.
-    synchronized (LOCK) {
-      INSTANCES.clear();
-    }
+    ComponentCompat.clear();
   }
 
   /**
@@ -542,10 +505,8 @@ public class FirebaseApp {
 
   private static List<String> getAllAppNames() {
     List<String> allAppNames = new ArrayList<>();
-    synchronized (LOCK) {
-      for (FirebaseApp app : INSTANCES.values()) {
-        allAppNames.add(app.getName());
-      }
+    for (ComponentRuntime componentRuntime : ComponentCompat.getAll()) {
+      allAppNames.add(componentRuntime.get(ContainerInfo.class).getAppName());
     }
     Collections.sort(allAppNames);
     return allAppNames;
@@ -560,11 +521,6 @@ public class FirebaseApp {
     } else {
       componentRuntime.initializeEagerComponents(isDefaultApp());
     }
-  }
-
-  /** Normalizes the app name. */
-  private static String normalize(@NonNull String name) {
-    return name.trim();
   }
 
   /**
@@ -620,10 +576,8 @@ public class FirebaseApp {
     @Override
     public void onReceive(Context context, Intent intent) {
       // API initialization is idempotent.
-      synchronized (LOCK) {
-        for (FirebaseApp app : INSTANCES.values()) {
-          app.initializeAllApis();
-        }
+      for (FirebaseApp app : getApps(context)) {
+        app.initializeAllApis();
       }
       unregister();
     }
@@ -658,22 +612,24 @@ public class FirebaseApp {
 
     @Override
     public void onBackgroundStateChanged(boolean background) {
-      synchronized (LOCK) {
-        for (FirebaseApp app : new ArrayList<>(INSTANCES.values())) {
-          if (app.automaticResourceManagementEnabled.get()) {
-            app.notifyBackgroundStateChangeListeners(background);
-          }
+      for (FirebaseApp app : getAllApps()) {
+        if (app.automaticResourceManagementEnabled.get()) {
+          app.notifyBackgroundStateChangeListeners(background);
         }
       }
     }
   }
 
-  private static class UiExecutor implements Executor {
-    private static final Handler HANDLER = new Handler(Looper.getMainLooper());
+  static class ContainerInfo {
 
-    @Override
-    public void execute(@NonNull Runnable command) {
-      HANDLER.post(command);
+    private final String appName;
+
+    private ContainerInfo(String appName) {
+      this.appName = appName;
+    }
+
+    public String getAppName() {
+      return appName;
     }
   }
 }
